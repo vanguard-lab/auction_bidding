@@ -1,163 +1,83 @@
-# Auction Bidding Backend
+# Auction Bidding — Reviewer Q&A
 
-Node.js + TypeScript + Express + PostgreSQL auction backend with JWT auth, concurrent bid handling, idempotency, and timezone-safe timestamps.
+### 1. Your data model and why you structured it that way
 
-## Quick Start
+**Structure:** `Auction`, `Bid`, and `User` are separate entities. The application uses Clean Architecture with domain models, use cases, repositories, and HTTP controllers.
 
-### 1. Install
-
-```bash
-npm install
-```
-
-### 2. Configure `.env`
-
-```env
-PORT=3000
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=auction_user
-DB_PASSWORD=auction_pass
-DB_NAME=auction_db
-JWT_SECRET=your-secret-key
-JWT_EXPIRES_IN=1h
-```
-
-### 3. Start PostgreSQL
-
-```bash
-docker-compose -f docker/docker-compose.yml --env-file .env up -d
-```
-
-### 4. Seed Database
-
-```bash
-export $(cat .env | xargs) && npx ts-node src/seed.ts
-```
-
-### 5. Start Server
-
-```bash
-export $(cat .env | xargs) && npm run dev
-```
-
-Server: `http://localhost:3000`
+The separation keeps **business rules independent from the database and Express layer**. This makes the auction logic easier to test and change without coupling it to TypeORM or HTTP concerns.
 
 ---
 
-## API
+### 2. How you handled the auction-close boundary case
 
-### Auth
+**Decision:** A bid at exactly `ends_at` is accepted; anything after `ends_at` is rejected.
 
-```http
-POST /api/auth/signup
-POST /api/auth/login
-```
+**How:**
+The application checks whether the auction is open, and the database performs the same check during the conditional `UPDATE`.
 
-```json
-{
-  "email": "user@example.com",
-  "password": "SecurePass123!"
-}
-```
-
-Both return a JWT `access_token`.
-
-### Auctions
-
-```http
-GET /api/auctions
-GET /api/auctions/:id
-GET /api/auctions/:id/bids
-```
-
-### Bidding
-
-```http
-POST /api/bid
-DELETE /api/bids/:id
-```
-
-Place a bid with:
-
-```http
-Authorization: Bearer <token>
-Idempotency-Key: <unique-key>
-```
-
-```json
-{
-  "auction_id": "uuid",
-  "user_id": "uuid",
-  "amount": 150
-}
-```
+**Why:**
+The application check alone is not sufficient because the auction could close **between the read and the write**. The database-level condition makes the final bid update atomic and protects the close boundary from race conditions.
 
 ---
 
-## Tests
+### 3. How you handled duplicate / retried bid requests
 
-### Full API Suite
+**Decision:** Bid requests are idempotent through an `Idempotency-Key`.
 
-```bash
-export $(cat .env | xargs) && node test-scripts/api-tests.js
-```
+**How:**
+The application first checks for an existing key, while the database enforces a `UNIQUE` constraint. If concurrent requests use the same key, only one can create the bid.
 
-Covers auth, auctions, bidding, idempotency, duplicate bids, deletion, and authorization.
-
-### Concurrent Bid Test
-
-```bash
-export $(cat .env | xargs) && node test-scripts/test-concurrent-bids.js
-```
-
-Sends 10 concurrent requests with the same idempotency key and verifies only one bid is created.
+**Why:**
+Clients can retry requests because of network failures or timeouts. Without idempotency, the same logical bid could be persisted multiple times. The database constraint provides the final guarantee even when requests arrive concurrently.
 
 ---
 
-## Where to Explore
+### 4. What did you decide for a user bidding on their own current top bid, and why?
 
-```text
-src/
-├── app/
-│   ├── application/      # Business logic / CQRS
-│   ├── configuration/    # Environment configuration
-│   └── http/             # Express routes & middleware
-├── infrastructure/       # PostgreSQL / TypeORM
-├── main.ts               # Application composition
-├── index.ts              # Entry point
-└── seed.ts               # Database seed
+**Decision:** The current implementation allows it.
 
-test-scripts/             # API and concurrency tests
-docker/                   # PostgreSQL setup
-```
+If User A is currently winning at `$100`, User A can bid `$150` and remain the top bidder.
 
-### Main areas to review
+**Why:**
+The assignment does not explicitly define self-outbidding as invalid, so the implementation currently treats a bid simply as valid when it is higher than the current top bid.
 
-* **Auth** → `src/app/application/` + auth HTTP routes
-* **Auction/Bid flow** → `src/app/application/`
-* **Concurrency** → bid application logic + PostgreSQL transaction/locking
-* **Idempotency** → bid flow + database constraint
-* **Timezone handling** → entity/database timestamp definitions
-* **API layer** → `src/app/http/`
-* **Database** → `src/infrastructure/`
+**Production change:** I would prevent self-outbidding because it provides no competitive value and can artificially increase the auction price.
 
 ---
 
-## Core Design Points
+### 5. One part of the assignment that is wrong, underspecified, or would cause a problem in production
 
-* JWT authentication
-* PostgreSQL `timestamptz` for UTC-safe timestamps
-* PostgreSQL row-level locking for concurrent bids
-* `Idempotency-Key` support for duplicate requests
-* Database-level uniqueness as the final idempotency safeguard
-* TypeORM for persistence
-* Request validation and authorization guards
+There are four areas I would address before production. These were intentionally kept out or simplified because of the assignment's time constraint.
 
-## Reset Database
+**1. No backend rate limiting / throttling**
 
-```bash
-docker-compose -f docker/docker-compose.yml down -v
-docker-compose -f docker/docker-compose.yml --env-file .env up -d
-export $(cat .env | xargs) && npx ts-node src/seed.ts
-```
+Client-side debouncing/throttling can reduce unnecessary requests, but it cannot be trusted because clients can bypass it.
+
+I would add **backend rate limiting**, scoped appropriately by user/IP, to prevent request flooding and resource exhaustion on the bid endpoint.
+
+**2. No minimum bid increment**
+
+The current implementation only requires the new bid to be higher than the current bid.
+
+I deliberately left minimum-increment validation out because **the assignment does not specify what the minimum increment should be**. Adding an arbitrary value would introduce an undefined business rule.
+
+In production, the minimum increment should be an explicit auction rule.
+
+**3. Application server time is used for the auction boundary**
+
+The current check uses `new Date()` from the application server. In a distributed environment, clock differences between servers can create inconsistencies around the exact auction-close boundary.
+
+I would use **database time (`NOW()`) for the final database-level check**, giving the transaction a single authoritative time source.
+
+**4. Idempotency-Key is not cached at the application/Redis layer**
+
+The current implementation relies on the **database-level unique constraint as the final idempotency guarantee**. This correctly prevents duplicate persistence, but every retry still reaches the application/database path.
+
+A production flow would be:
+
+`Application-level check → Redis idempotency cache → DB unique constraint/final check`
+
+The application layer can handle fast duplicate detection, Redis can prevent repeated processing across application instances, and the **database remains the final source of truth** for concurrency and uniqueness.
+
+I deliberately did not add Redis because it was outside the practical time constraint of the assignment. The database-level protection is the part that was prioritized because it provides the correctness guarantee even when concurrent requests bypass the application/Redis layer.
+
